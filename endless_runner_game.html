@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Variable Jump Runner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+        }
+        canvas {
+            display: block;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800 min-h-screen flex flex-col items-center justify-center p-4">
+
+    <!-- Game Container -->
+    <div class="relative w-full max-w-4xl flex flex-col items-center">
+        <!-- Canvas Header UI -->
+        <div class="w-full flex justify-between items-center mb-3 px-2">
+            <h1 class="text-xl md:text-2xl font-bold text-sky-600 tracking-wider">RUNNER DASH</h1>
+            <div class="flex gap-4 md:gap-6 font-mono text-xs md:text-base">
+                <div>DIFF: <span id="diffDisplay" class="text-emerald-600 font-bold">EASY</span></div>
+                <div>TIME: <span id="timeDisplay" class="text-amber-600 font-bold">0.00</span>s</div>
+                <div>DIST: <span id="distDisplay" class="text-sky-600 font-bold">0</span>m / <span id="goalDistDisplay">500</span>m</div>
+            </div>
+        </div>
+
+        <!-- Canvas Frame -->
+        <div class="relative w-full aspect-[16/9] bg-sky-100 rounded-xl overflow-hidden border-2 border-sky-300 shadow-xl">
+            <canvas id="gameCanvas" class="w-full h-full"></canvas>
+
+            <!-- Touch Jump Overlay for Mobile -->
+            <div id="touchArea" class="absolute inset-0 z-10 hidden active:bg-sky-500/10 transition-colors"></div>
+        </div>
+
+        <!-- Instructions & Mobile Controls Hint -->
+        <div class="w-full mt-4 flex flex-col md:flex-row justify-between items-center text-xs md:text-sm text-slate-600 gap-2 px-2">
+            <div>
+                <span class="inline-block bg-sky-100 border border-sky-400 text-sky-800 rounded px-2 py-0.5 font-bold font-mono">💡 画面を一度クリックしてキー入力を有効化</span>
+            </div>
+            <div>
+                <span class="inline-block bg-slate-200 border border-slate-400 rounded px-2 py-0.5 text-slate-700 font-mono">SPACE</span>
+                <span>/ 画面長押しして放す : 長さに応じて高ジャンプ</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Core Setup & State ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const timeDisplay = document.getElementById('timeDisplay');
+        const distDisplay = document.getElementById('distDisplay');
+        const goalDistDisplay = document.getElementById('goalDistDisplay');
+        const diffDisplay = document.getElementById('diffDisplay');
+
+        // Target World Length for Goal
+        const GOAL_DISTANCE = 5000; // In-game pixels / 10 = meters
+        goalDistDisplay.textContent = (GOAL_DISTANCE / 10).toString();
+
+        // Game States: 'START', 'PLAYING', 'GAMEOVER', 'CLEAR'
+        let gameState = 'START';
+        let currentDifficulty = 'EASY'; // 'EASY', 'NORMAL', 'HARD'
+        let isPaused = false; // Pause state flag
+
+        let lastTime = 0;
+        let elapsedTime = 0;
+        let cameraX = 0;
+
+        // Simple Seeded Random Generator for deterministic fixed courses per difficulty
+        let seed = 1;
+        function seededRandom() {
+            let x = Math.sin(seed++) * 10000;
+            return x - Math.floor(x);
+        }
+
+        // Difficulty Presets
+        const DIFFICULTY_SETTINGS = {
+            EASY: {
+                name: 'EASY',
+                speed: 340,
+                color: '#34d399',
+                minGap: 80,
+                maxGap: 140,
+                minPlatWidth: 200,
+                maxPlatWidth: 400,
+                maxElevationDelta: 40
+            },
+            NORMAL: {
+                name: 'NORMAL',
+                speed: 380,
+                color: '#fbbf24',
+                minGap: 100,
+                maxGap: 200,
+                minPlatWidth: 140,
+                maxPlatWidth: 280,
+                maxElevationDelta: 70
+            },
+            HARD: {
+                name: 'HARD',
+                speed: 430,
+                color: '#f87171',
+                minGap: 120,
+                maxGap: 260,
+                minPlatWidth: 80,
+                maxPlatWidth: 180,
+                maxElevationDelta: 110
+            }
+        };
+
+        // Best Times
+        const bestTimes = {
+            EASY: null,
+            NORMAL: null,
+            HARD: null
+        };
+
+        // --- Physics & Control Constants ---
+        const MIN_JUMP_FORCE = -350; // Minimum jump velocity
+        const MAX_JUMP_FORCE = -850; // Maximum jump velocity
+        const MAX_HOLD_TIME = 0.35;  // Hold time required for MAX_JUMP_FORCE
+        let currentRunSpeed = 340;   // Auto-scroll speed (updated by difficulty)
+        const GRAVITY = 1800;        // Gravity strength (px/s^2)
+
+        // --- Player Object ---
+        const player = {
+            x: 100,
+            y: 0,
+            width: 32,
+            height: 48,
+            vx: currentRunSpeed,
+            vy: 0,
+            isGrounded: false,
+            holdTime: 0
+        };
+
+        // --- Keyboard & Touch State ---
+        let isHolding = false;
+
+        // --- Level Generation Structures ---
+        let platforms = [];
+        let finishLine = null;
+
+        // Difficulty Buttons Click Targets for Canvas Overlay
+        let difficultyButtons = [];
+
+        // Input Event Listeners & Game State Handlers
+        function handleInputPress(clientX, clientY) {
+            // Force focus on window when interacting (Fixes iframe focus issue in shared links)
+            window.focus();
+
+            // Check difficulty button clicks if in START/GAMEOVER/CLEAR menu
+            if (gameState !== 'PLAYING' && clientX !== undefined && clientY !== undefined) {
+                const rect = canvas.getBoundingClientRect();
+                const canvasX = (clientX - rect.left) * (canvas.width / rect.width);
+                const canvasY = (clientY - rect.top) * (canvas.height / rect.height);
+
+                for (const btn of difficultyButtons) {
+                    if (
+                        canvasX >= btn.x &&
+                        canvasX <= btn.x + btn.w &&
+                        canvasY >= btn.y &&
+                        canvasY <= btn.y + btn.h
+                    ) {
+                        setDifficulty(btn.diff);
+                        return;
+                    }
+                }
+            }
+
+            if (gameState === 'START' || gameState === 'GAMEOVER' || gameState === 'CLEAR') {
+                resetGame();
+                gameState = 'PLAYING';
+                return;
+            }
+            
+            if (gameState === 'PLAYING') {
+                isHolding = true;
+            }
+        }
+
+        function handleInputRelease() {
+            if (gameState === 'PLAYING' && isHolding) {
+                isHolding = false;
+                if (player.isGrounded) {
+                    const ratio = Math.min(player.holdTime / MAX_HOLD_TIME, 1.0);
+                    const jumpVelocity = MIN_JUMP_FORCE + (MAX_JUMP_FORCE - MIN_JUMP_FORCE) * ratio;
+                    
+                    player.vy = jumpVelocity;
+                    player.isGrounded = false;
+                }
+                player.holdTime = 0;
+            }
+        }
+
+        // Global Focus & Keyboard Controls
+        window.addEventListener('click', () => { window.focus(); });
+        
+        window.addEventListener('keydown', (e) => {
+            window.focus();
+
+            // Handle Pause Toggle with 'P' key during play
+            if (e.key === 'p' || e.key === 'P') {
+                if (gameState === 'PLAYING') {
+                    isPaused = !isPaused;
+                    return;
+                }
+            }
+
+            // Handle Escape key to quit current game and return to title menu
+            if (e.key === 'Escape') {
+                if (gameState === 'PLAYING' || isPaused) {
+                    gameState = 'START';
+                    isPaused = false;
+                    return;
+                }
+            }
+
+            // Arrow keys navigation for mode select on Menu/Title screen
+            if (gameState !== 'PLAYING' || isPaused) {
+                const diffKeys = ['EASY', 'NORMAL', 'HARD'];
+                const currentIndex = diffKeys.indexOf(currentDifficulty);
+
+                if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    const nextIndex = (currentIndex + 1) % diffKeys.length;
+                    setDifficulty(diffKeys[nextIndex]);
+                    return;
+                } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    const prevIndex = (currentIndex - 1 + diffKeys.length) % diffKeys.length;
+                    setDifficulty(diffKeys[prevIndex]);
+                    return;
+                }
+            }
+
+            // Resume from Pause via Space
+            if (isPaused && (e.code === 'Space' || e.key === ' ')) {
+                isPaused = false;
+                return;
+            }
+
+            if (e.code === 'Space' || e.key === ' ' || e.keyCode === 32) {
+                e.preventDefault(); // Prevent page scrolling
+                if (!e.repeat) {
+                    handleInputPress();
+                }
+            } else if (e.key === '1') {
+                setDifficulty('EASY');
+            } else if (e.key === '2') {
+                setDifficulty('NORMAL');
+            } else if (e.key === '3') {
+                setDifficulty('HARD');
+            } else if (gameState !== 'PLAYING') {
+                handleInputPress();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' || e.key === ' ' || e.keyCode === 32) {
+                e.preventDefault();
+                handleInputRelease();
+            }
+        });
+
+        // Touch & Mouse Controls
+        const touchArea = document.getElementById('touchArea');
+        touchArea.classList.remove('hidden');
+
+        touchArea.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            handleInputPress(e.clientX, e.clientY);
+        });
+
+        touchArea.addEventListener('pointerup', (e) => {
+            e.preventDefault();
+            handleInputRelease();
+        });
+
+        touchArea.addEventListener('pointercancel', (e) => {
+            e.preventDefault();
+            handleInputRelease();
+        });
+
+        // Responsive Canvas Resizing
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- Difficulty Setup ---
+        function setDifficulty(diff) {
+            if (!DIFFICULTY_SETTINGS[diff]) return;
+            currentDifficulty = diff;
+            const settings = DIFFICULTY_SETTINGS[diff];
+            
+            if (diffDisplay) {
+                diffDisplay.textContent = settings.name;
+                diffDisplay.style.color = settings.color;
+            }
+            
+            resetGame();
+        }
+
+        // --- Game Logic Functions ---
+        function resetGame() {
+            const settings = DIFFICULTY_SETTINGS[currentDifficulty];
+            currentRunSpeed = settings.speed;
+
+            player.x = 100;
+            player.y = 200;
+            player.vx = currentRunSpeed;
+            player.vy = 0;
+            player.isGrounded = false;
+            player.holdTime = 0;
+
+            isHolding = false;
+            isPaused = false;
+            cameraX = 0;
+            elapsedTime = 0;
+            lastTime = performance.now();
+
+            generateLevel();
+        }
+
+        function generateLevel() {
+            platforms = [];
+            let currentX = 0;
+            let currentY = 320;
+            const settings = DIFFICULTY_SETTINGS[currentDifficulty];
+            
+            // Reset random seed based on difficulty so course is ALWAYS identical for each difficulty
+            seed = currentDifficulty === 'EASY' ? 12345 : currentDifficulty === 'NORMAL' ? 67890 : 99999;
+
+            // Starting safe platform
+            platforms.push({ x: 0, y: currentY, width: 500, height: 300 });
+            currentX = 500;
+
+            // Generate deterministic fixed platforms using seeded random
+            while (currentX < GOAL_DISTANCE) {
+                const gapWidth = Math.floor(seededRandom() * (settings.maxGap - settings.minGap)) + settings.minGap; 
+                const platWidth = Math.floor(seededRandom() * (settings.maxPlatWidth - settings.minPlatWidth)) + settings.minPlatWidth;
+                
+                // Height variation
+                const yDelta = Math.floor(seededRandom() * (settings.maxElevationDelta * 2)) - settings.maxElevationDelta;
+                currentY = Math.min(Math.max(currentY + yDelta, 200), 400);
+
+                currentX += gapWidth;
+                platforms.push({ x: currentX, y: currentY, width: platWidth, height: 400 });
+                currentX += platWidth;
+            }
+
+            // Finish Line at the end of final platform
+            finishLine = { x: GOAL_DISTANCE, y: 0, width: 16, height: 500 };
+        }
+
+        // --- Physics & Game Loop ---
+        function update(dt) {
+            if (gameState !== 'PLAYING' || isPaused) return;
+
+            elapsedTime += dt;
+            timeDisplay.textContent = elapsedTime.toFixed(2);
+            distDisplay.textContent = Math.min(Math.floor(player.x / 10), GOAL_DISTANCE / 10);
+
+            // Forward Movement
+            player.x += player.vx * dt;
+
+            // Accumulate hold time
+            if (isHolding) {
+                player.holdTime = Math.min(player.holdTime + dt, MAX_HOLD_TIME);
+            }
+
+            // Gravity Applied
+            player.vy += GRAVITY * dt;
+            player.y += player.vy * dt;
+
+            // Collision Detection with Platforms
+            let landed = false;
+            if (player.vy >= 0) {
+                for (const plat of platforms) {
+                    if (player.x + player.width > plat.x && player.x < plat.x + plat.width) {
+                        if (
+                            player.y + player.height >= plat.y &&
+                            player.y + player.height - player.vy * dt <= plat.y + 24
+                        ) {
+                            player.y = plat.y - player.height;
+                            player.vy = 0;
+                            landed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            player.isGrounded = landed;
+
+            // Goal Check
+            if (player.x >= GOAL_DISTANCE) {
+                gameState = 'CLEAR';
+                // Record best time
+                if (!bestTimes[currentDifficulty] || elapsedTime < bestTimes[currentDifficulty]) {
+                    bestTimes[currentDifficulty] = elapsedTime;
+                }
+            }
+
+            // Fall into Pit Check (Game Over)
+            if (player.y > canvas.height + 100) {
+                gameState = 'GAMEOVER';
+            }
+
+            // Move Camera
+            cameraX = player.x - 100;
+        }
+
+        // --- Render Logic ---
+        function render() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Bright Sky Gradient Background
+            const bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+            bgGrad.addColorStop(0, '#e0f2fe'); // Light sky blue
+            bgGrad.addColorStop(1, '#bae6fd'); // Soft vibrant cyan
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw Background Parallax Clouds
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+            for (let i = 0; i < 5; i++) {
+                const cloudX = ((i * 300 - cameraX * 0.2) % (canvas.width + 400)) - 100;
+                const cloudY = 40 + (i % 3) * 35;
+                ctx.beginPath();
+                ctx.arc(cloudX, cloudY, 30, 0, Math.PI * 2);
+                ctx.arc(cloudX + 25, cloudY - 10, 35, 0, Math.PI * 2);
+                ctx.arc(cloudX + 50, cloudY, 30, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.save();
+            ctx.translate(-cameraX, 0);
+
+            // Draw Platforms
+            for (const plat of platforms) {
+                // Earthy brown gradient for ground/dirt texture
+                const grad = ctx.createLinearGradient(0, plat.y, 0, plat.y + plat.height);
+                grad.addColorStop(0, '#4a3525');
+                grad.addColorStop(1, '#24170d');
+                ctx.fillStyle = grad;
+                ctx.fillRect(plat.x, plat.y, plat.width, plat.height);
+
+                // Highlight top boundary line based on difficulty color (green/yellow/red)
+                ctx.fillStyle = DIFFICULTY_SETTINGS[currentDifficulty].color;
+                ctx.fillRect(plat.x, plat.y, plat.width, 5);
+            }
+
+            // Draw Finish Line
+            if (finishLine) {
+                ctx.fillStyle = '#d97706';
+                ctx.fillRect(finishLine.x, 0, 8, canvas.height);
+            }
+
+            // Draw Player
+            let drawHeight = player.height;
+            let drawY = player.y;
+
+            if (isHolding && player.isGrounded) {
+                const chargeRatio = Math.min(player.holdTime / MAX_HOLD_TIME, 1.0);
+                drawHeight = player.height * (1 - chargeRatio * 0.3);
+                drawY = player.y + (player.height - drawHeight);
+                ctx.fillStyle = '#eab308'; // Squat charge color
+            } else {
+                ctx.fillStyle = '#0284c7';
+            }
+
+            ctx.fillRect(player.x, drawY, player.width, drawHeight);
+
+            ctx.restore();
+
+            // --- Overlay UIs ---
+            if (isPaused) {
+                drawOverlay('PAUSED', 'Press P or Space to Resume | Press ESC to Exit to Menu');
+            } else if (gameState === 'START') {
+                drawOverlay('RUNNER DASH', 'Use Arrow Keys / 1,2,3 / Click to Select Difficulty & Press SPACE');
+            } else if (gameState === 'GAMEOVER') {
+                drawOverlay('GAME OVER', 'Fell into a pit! Tap / Space to Retry');
+            } else if (gameState === 'CLEAR') {
+                const best = bestTimes[currentDifficulty] ? `${bestTimes[currentDifficulty].toFixed(2)}s` : '--';
+                drawOverlay('GOAL CLEAR!', `Time: ${elapsedTime.toFixed(2)}s (Best: ${best}) - Tap / Space to Play Again`);
+            }
+        }
+
+        function drawOverlay(title, subtitle) {
+            ctx.fillStyle = 'rgba(241, 245, 249, 0.88)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.fillStyle = '#0284c7';
+            ctx.font = 'bold 36px Inter, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(title, canvas.width / 2, canvas.height / 2 - 70);
+
+            ctx.fillStyle = '#475569';
+            ctx.font = '15px Inter, sans-serif';
+            ctx.fillText(subtitle, canvas.width / 2, canvas.height / 2 - 30);
+
+            // Draw Difficulty Selector Buttons
+            difficultyButtons = [];
+            const btnWidth = 100;
+            const btnHeight = 40;
+            const gap = 20;
+            const startX = canvas.width / 2 - (btnWidth * 3 + gap * 2) / 2;
+            const btnY = canvas.height / 2 + 20;
+
+            const diffKeys = ['EASY', 'NORMAL', 'HARD'];
+
+            diffKeys.forEach((key, index) => {
+                const bx = startX + index * (btnWidth + gap);
+                const isSelected = (currentDifficulty === key);
+                const conf = DIFFICULTY_SETTINGS[key];
+
+                // Save button area for touch/mouse click
+                difficultyButtons.push({ x: bx, y: btnY, w: btnWidth, h: btnHeight, diff: key });
+
+                // Button Background
+                ctx.fillStyle = isSelected ? conf.color : '#e2e8f0';
+                ctx.beginPath();
+                ctx.roundRect(bx, btnY, btnWidth, btnHeight, 8);
+                ctx.fill();
+
+                if (isSelected) {
+                    ctx.strokeStyle = '#0284c7';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                // Button Text
+                ctx.fillStyle = isSelected ? '#ffffff' : '#334155';
+                ctx.font = 'bold 14px Inter, sans-serif';
+                ctx.fillText(key, bx + btnWidth / 2, btnY + 24);
+            });
+        }
+
+        // --- Main Loop ---
+        function gameLoop(timestamp) {
+            const dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+            lastTime = timestamp;
+
+            update(dt);
+            render();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        setDifficulty('EASY');
+        resetGame();
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
